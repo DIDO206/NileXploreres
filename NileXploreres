@@ -1,0 +1,494 @@
+// =================================================================================
+// 1. الإعدادات والحدود الزمنية والمكانية
+// =================================================================================
+
+// تحديد المنطقة: حدود مصر
+var egypt = ee.FeatureCollection("FAO/GAUL/2015/level0")
+              .filter(ee.Filter.eq("ADM0_NAME", "Egypt"));
+var aoi = egypt.geometry().bounds(); 
+
+var START_YEAR = 2000;
+var END_YEAR = 2025;
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+
+// =================================================================================
+// 2. الحصول على البيانات ومعالجتها (المقاييس الأربعة)
+// =================================================================================
+
+// 2.1. الغطاء النباتي (NDVI) - من MODIS/MOD13A2
+var ndviCollection = ee.ImageCollection("MODIS/061/MOD13A2")
+                          .filterBounds(aoi)
+                          .filterDate("2000-01-01", "2025-12-31")
+                          .select('NDVI')
+                          .map(function(img) {
+                            return img.divide(10000).rename('NDVI').copyProperties(img, ['system:time_start']);
+                          });
+
+// 2.2. مؤشر المياه (EVI كبديل لنقص المياه والتلوث) - من MODIS/MOD13A2
+var waterProxyCollection = ee.ImageCollection("MODIS/061/MOD13A2")
+                          .filterBounds(aoi)
+                          .filterDate("2000-01-01", "2025-12-31")
+                          .select('EVI')
+                          .map(function(img) {
+                            return img.divide(10000).rename('Water_Proxy').copyProperties(img, ['system:time_start']);
+                          });
+
+// 2.3. درجة الحرارة (LST) - من MODIS/MOD11A2
+var lstCollection = ee.ImageCollection("MODIS/061/MOD11A2")
+                  .filterBounds(aoi)
+                  .filterDate("2000-01-01", "2025-12-31")
+                  .map(function(img) {
+                    var lst = img.select('LST_Day_1km')
+                               .multiply(0.02)
+                               .subtract(273.15) // تحويل كلفن إلى سيليزيوس
+                               .rename('LST');
+                    return lst.copyProperties(img, ['system:time_start']);
+                  });
+
+// 2.4. دالة المتوسط السنوي
+function yearlyComposite(collection, year) {
+  var start = ee.Date.fromYMD(ee.Number(year), 1, 1);
+  var end = start.advance(1, 'year');
+  return collection.filterDate(start, end).median().set('year', year);
+}
+
+// إنشاء المجموعات السنوية
+var yearlyNDVI = ee.ImageCollection.fromImages(
+  years.map(function(y){ return yearlyComposite(ndviCollection, y); })
+);
+
+var yearlyWaterProxy = ee.ImageCollection.fromImages(
+  years.map(function(y){ return yearlyComposite(waterProxyCollection, y); })
+);
+
+var yearlyLST = ee.ImageCollection.fromImages(
+  years.map(function(y){ return yearlyComposite(lstCollection, y); })
+);
+
+// =================================================================================
+// 3. واجهة المستخدم (UI) - اللوحة الرئيسية
+// =================================================================================
+
+var controlPanel = ui.Panel({
+  style: {width: '350px', padding: '10px'} 
+});
+ui.root.insert(0, controlPanel);
+
+// العنوان
+controlPanel.add(ui.Label('🌍 خريطة النيل التفاعلية (2000-2025)', {
+  fontWeight: 'bold', 
+  fontSize: '18px', 
+  textAlign: 'right', 
+  stretch: 'horizontal'
+}));
+controlPanel.add(ui.Label('----------------------------------'));
+
+// ---------------------------
+// A. شريط اختيار السنة (Slider) - تم تعديل البنية
+// ---------------------------
+var yearLabel = ui.Label('اختر السنة:', {fontWeight: 'bold'});
+
+var decrementButton = ui.Button({
+  label: '-',
+  style: {width: '30px', margin: '4px 0 0 0', padding: '0'}
+});
+
+var yearSlider = ui.Slider({
+  min: START_YEAR,
+  max: END_YEAR,
+  value: END_YEAR, 
+  step: 1,
+  style: {stretch: 'horizontal', margin: '4px 4px 0 4px'} // تم تعديل الهوامش
+});
+
+var incrementButton = ui.Button({
+  label: '+',
+  style: {width: '30px', margin: '4px 0 0 0', padding: '0'}
+});
+
+// تجميع عناصر التحكم بالسنة في صف أفقي واحد
+var yearControlPanel = ui.Panel({
+  widgets: [decrementButton, yearSlider, incrementButton],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {stretch: 'horizontal', padding: '0'}
+});
+
+controlPanel.add(yearLabel);
+controlPanel.add(yearControlPanel); // إضافة لوحة التحكم الجديدة
+
+// ---------------------------
+// B. مؤشرات التفعيل (Checkboxes)
+// ---------------------------
+controlPanel.add(ui.Label('تفعيل المؤشرات:', {fontWeight: 'bold', margin: '20px 0 5px 0', textAlign: 'right'}));
+
+var vegetationCheck = ui.Checkbox('الغطاء النباتي (NDVI)', true);
+var tempCheck = ui.Checkbox('درجة الحرارة (LST)', false);
+var waterScarcityCheck = ui.Checkbox('نقص المياه (تقديري)', false);
+var pollutionCheck = ui.Checkbox('تلوث المياه (تقديري)', false);
+
+controlPanel.add(vegetationCheck);
+controlPanel.add(tempCheck);
+controlPanel.add(waterScarcityCheck);
+controlPanel.add(pollutionCheck);
+
+// ---------------------------
+// C. أشرطة القيم (Threshold Sliders)
+// ---------------------------
+controlPanel.add(ui.Label('----------------------------------'));
+controlPanel.add(ui.Label('تحديد العتبات (Thresholds):', {fontWeight: 'bold', textAlign: 'right'}));
+
+// عتبة نقص المياه
+var scarcityLabel = ui.Label('عتبة نقص المياه (أقل من: 0.1):');
+var scarcitySlider = ui.Slider({min: -0.5, max: 0.5, step: 0.01, value: 0.1, style: {stretch: 'horizontal'}});
+controlPanel.add(scarcityLabel);
+controlPanel.add(scarcitySlider);
+
+// عتبة تلوث المياه
+var pollutionLabel = ui.Label('عتبة التلوث التقديري (أقل من: 0.0):');
+var pollutionSlider = ui.Slider({min: -0.5, max: 0.5, step: 0.01, value: 0.0, style: {stretch: 'horizontal'}});
+controlPanel.add(pollutionLabel);
+controlPanel.add(pollutionSlider);
+
+// ---------------------------
+// D. الرسوم المتحركة (Animation)
+// ---------------------------
+controlPanel.add(ui.Label('----------------------------------'));
+controlPanel.add(ui.Label('عرض التغيرات الزمنية (Animation):', {fontWeight: 'bold', textAlign: 'right'}));
+
+var animateButton = ui.Button({
+  label: '▶ تشغيل الحركة (الغطاء النباتي 2000-' + END_YEAR + ')',
+  style: {stretch: 'horizontal'}
+});
+controlPanel.add(animateButton);
+
+// =================================================================================
+// 4. وظائف الألوان والمفاتيح (Legends) - تم تحديثها بالكامل
+// =================================================================================
+
+// دالة متقدمة لإضافة مفتاح الألوان للتدرجات (NDVI و LST)
+var addAdvancedLegend = function(title, palette, min, max, units, position, description) {
+  var legendPanel = ui.Panel({
+    style: {
+      position: position || 'bottom-left',
+      padding: '12px',
+      backgroundColor: 'white',
+      border: '2px solid #333',
+      borderRadius: '8px',
+      fontSize: '14px',
+      fontWeight: 'bold'
+    }
+  });
+
+  // عنوان المفتاح
+  var legendTitle = ui.Label({
+    value: '🗺 ' + title,
+    style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 8px 0', color: '#2c3e50'}
+  });
+  legendPanel.add(legendTitle);
+
+  // شرح المؤشر
+  if (description) {
+    var descLabel = ui.Label({
+      value: description,
+      style: {fontSize: '12px', margin: '0 0 10px 0', color: '#7f8c8d'}
+    });
+    legendPanel.add(descLabel);
+  }
+
+  // إنشاء شريط التدرج اللوني
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0).visualize({
+      min: 0,
+      max: 100,
+      palette: palette,
+    }),
+    params: {bbox:'0,0,10,10', dimensions:'150x20', format:'png'},
+    style: {stretch: 'horizontal', margin: '0px 8px', height: '20px'}
+  });
+  legendPanel.add(colorBar);
+
+  // تسميات القيم (Min, Mid, Max)
+  var labels = ui.Panel({
+    widgets: [
+      ui.Label('منخفض ←', {margin: '4px 8px 0 0', fontSize: '11px', fontWeight: 'bold'}),
+      ui.Label('→ مرتفع', {margin: '4px 0 0 8px', fontSize: '11px', fontWeight: 'bold'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+  legendPanel.add(labels);
+
+  // القيم الرقمية
+  var values = ui.Panel({
+    widgets: [
+      ui.Label(min.toFixed(1), {margin: '2px 8px 0 0', fontSize: '11px'}),
+      ui.Label(((min + max) / 2).toFixed(1), {margin: '2px 0', textAlign: 'center', stretch: 'horizontal', fontSize: '11px'}),
+      ui.Label(max.toFixed(1), {margin: '2px 0 0 8px', fontSize: '11px'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+  legendPanel.add(values);
+
+  // الوحدة
+  if (units) {
+    var unitLabel = ui.Label({
+      value: 'الوحدة: ' + units,
+      style: {fontSize: '11px', margin: '4px 0 0 0', color: '#7f8c8d', fontStyle: 'italic'}
+    });
+    legendPanel.add(unitLabel);
+  }
+
+  Map.add(legendPanel);
+};
+
+// دالة جديدة لمفاتيح الألوان للطبقات الثنائية (نقص المياه والتلوث)
+var addBinaryLegend = function(title, color, description, position, details) {
+  var legendPanel = ui.Panel({
+    style: {
+      position: position,
+      padding: '12px',
+      backgroundColor: 'white',
+      border: '2px solid #333',
+      borderRadius: '8px',
+      fontSize: '14px'
+    }
+  });
+
+  // العنوان الرئيسي
+  var legendTitle = ui.Label({
+    value: title,
+    style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 8px 0', color: '#2c3e50'}
+  });
+  legendPanel.add(legendTitle);
+
+  // مربع اللون الكبير
+  var colorBox = ui.Panel({
+    widgets: [
+      ui.Label('', {
+        backgroundColor: color, 
+        padding: '15px',
+        margin: '0 12px 0 0',
+        border: '1px solid #333'
+      })
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+  legendPanel.add(colorBox);
+
+  // الوصف
+  var descLabel = ui.Label({
+    value: description,
+    style: {fontSize: '13px', margin: '8px 0', fontWeight: 'bold', color: color}
+  });
+  legendPanel.add(descLabel);
+
+  // التفاصيل الإضافية
+  if (details) {
+    var detailsLabel = ui.Label({
+      value: details,
+      style: {fontSize: '12px', margin: '4px 0 0 0', color: '#7f8c8d'}
+    });
+    legendPanel.add(detailsLabel);
+  }
+
+  Map.add(legendPanel);
+};
+
+// =================================================================================
+// 5. دالة تحديث لوحة التحكم (Map Update Function) - تم تحديثها بالكامل
+// =================================================================================
+
+function updateDashboard() {
+  // مسح جميع الطبقات والمفاتيح لضمان التحديث الصحيح
+  Map.layers().reset();
+  
+  // إزالة مفاتيح الخرائط السابقة فقط
+  Map.widgets().forEach(function(w) {
+    if (w && w.style) {
+      Map.remove(w);
+    }
+  });
+
+  // جلب قيمة السنة الحالية
+  var year = yearSlider.getValue(); 
+  
+  // التأكد من جلب الصورة السنوية الصحيحة حسب السنة المختارة
+  var ndviImg = yearlyNDVI.filter(ee.Filter.eq('year', year)).first();
+  var waterProxyImg = yearlyWaterProxy.filter(ee.Filter.eq('year', year)).first();
+  var lstImg  = yearlyLST.filter(ee.Filter.eq('year', year)).first();
+  
+  // تحديث تسميات الـ Sliders
+  scarcityLabel.setValue('عتبة نقص المياه (أقل من: ' + scarcitySlider.getValue().toFixed(2) + '):');
+  pollutionLabel.setValue('عتبة التلوث التقديري (أقل من: ' + pollutionSlider.getValue().toFixed(2) + '):');
+  
+  // تحديث تسمية السنة المعروضة
+  yearLabel.setValue('اختر السنة: ' + year); 
+
+  // 1. الغطاء النباتي (NDVI) - 🟤🟡🟢🟢
+  var ndviViz = {min: 0.05, max: 0.8, palette: ['brown', 'yellow', 'green', 'darkgreen'], opacity: 0.7};
+  if(vegetationCheck.getValue() && ndviImg) {
+      Map.addLayer(ndviImg.clip(aoi), ndviViz, 'الغطاء النباتي (NDVI)', true);
+      addAdvancedLegend(
+        'مؤشر الغطاء النباتي', 
+        ndviViz.palette, 
+        ndviViz.min, 
+        ndviViz.max, 
+        '(NDVI)', 
+        'bottom-right',
+        'يقيس كثافة النباتات: البني (قاحل) ← الأخضر (كثيف)'
+      );
+  }
+
+  // 2. درجة الحرارة (LST) - 🔵🟢🟡🔴
+  var tempViz = {min: 20, max: 45, palette: ['blue', 'cyan', 'yellow', 'red'], opacity: 0.6};
+  if(tempCheck.getValue() && lstImg) {
+      Map.addLayer(lstImg.clip(aoi), tempViz, 'درجة الحرارة (LST)', false);
+      addAdvancedLegend(
+        'درجة حرارة السطح', 
+        tempViz.palette, 
+        tempViz.min, 
+        tempViz.max, 
+        '(درجة مئوية)', 
+        'bottom-left',
+        'درجة حرارة الأرض: الأزرق (بارد) ← الأحمر (حار)'
+      );
+  }
+
+  // 3. نقص المياه (Water Scarcity) - 🔴
+  if(waterScarcityCheck.getValue() && waterProxyImg) {
+    var scarcityThreshold = scarcitySlider.getValue();
+    var waterScarcity = waterProxyImg.lt(scarcityThreshold).selfMask().clip(aoi);
+    var scarcityViz = {palette: ['#FF0000'], opacity: 0.8}; 
+    Map.addLayer(waterScarcity, scarcityViz, 'نقص المياه (Scarcity)', false);
+    
+    // مفتاح الألوان لنقص المياه (أحمر)
+    addBinaryLegend(
+      '🚨 نقص المياه', 
+      '#FF0000', 
+      'مناطق نقص المياه', 
+      'top-left',
+      'اللون الأحمر يظهر المناطق التي تعاني من شح في المياه بناءً على مؤشر EVI المنخفض'
+    );
+  }
+  
+  // 4. تلوث المياه (Pollution Proxy) - 🟣
+  if(pollutionCheck.getValue() && waterProxyImg) {
+    var pollutionThreshold = pollutionSlider.getValue();
+    var waterPollution = waterProxyImg.lt(pollutionThreshold).selfMask().clip(aoi);
+    var pollutionViz = {palette: ['#800080'], opacity: 0.8}; 
+    Map.addLayer(waterPollution, pollutionViz, 'تلوث المياه (Pollution)', false);
+    
+    // مفتاح الألوان لتلوث المياه (بنفسجي)
+    addBinaryLegend(
+      '⚠ تلوث المياه', 
+      '#800080', 
+      'مناطق التلوث المائي', 
+      'top-right',
+      'اللون البنفسجي يظهر المناطق المحتملة لتلوث المياه بناءً على مؤشر EVI المنخفض'
+    );
+  }
+
+  // إضافة حدود المنطقة
+  Map.addLayer(egypt, {color: 'red', fillColor: '00000000'}, "حدود مصر", false);
+  
+  // إضافة مفتاح إضافي يشرح كل الألوان
+  var generalLegend = ui.Panel({
+    widgets: [
+      ui.Label('🗝 شرح الألوان في الخريطة:', {
+        fontWeight: 'bold', 
+        fontSize: '16px', 
+        margin: '0 0 8px 0',
+        color: '#2c3e50'
+      }),
+      ui.Label('🟢 الأخضر: نباتات كثيفة', {margin: '2px 0', fontSize: '13px'}),
+      ui.Label('🟡 الأصفر: نباتات متوسطة', {margin: '2px 0', fontSize: '13px'}),
+      ui.Label('🟤 البني: مناطق قاحلة', {margin: '2px 0', fontSize: '13px'}),
+      ui.Label('🔵 الأزرق: مناطق باردة', {margin: '2px 0', fontSize: '13px'}),
+      ui.Label('🔴 الأحمر: مناطق حارة', {margin: '2px 0', fontSize: '13px'}),
+      ui.Label('🚨 الأحمر الفاتح: نقص مياه', {margin: '2px 0', fontSize: '13px', color: '#FF0000'}),
+      ui.Label('🟣 البنفسجي: تلوث مياه', {margin: '2px 0', fontSize: '13px', color: '#800080'})
+    ],
+    style: {
+      position: 'top-right',
+      padding: '15px',
+      backgroundColor: 'white',
+      border: '2px solid #333',
+      borderRadius: '8px',
+      margin: '0 0 0 400px' // لضمان عدم التداخل مع المفاتيح الأخرى
+    }
+  });
+  
+  Map.add(generalLegend);
+  
+  Map.centerObject(aoi, 6);
+}
+
+// ---------------------------
+// دالة لزيادة السنة
+var incrementYear = function() {
+  var currentYear = yearSlider.getValue();
+  if (currentYear < END_YEAR) {
+    yearSlider.setValue(currentYear + 1);
+    updateDashboard();
+  }
+};
+
+// دالة لإنقاص السنة
+var decrementYear = function() {
+  var currentYear = yearSlider.getValue();
+  if (currentYear > START_YEAR) {
+    yearSlider.setValue(currentYear - 1);
+    updateDashboard();
+  }
+};
+
+// ---------------------------
+// 6. وظيفة الرسوم المتحركة (Animation Function)
+// ---------------------------
+
+var createAnimation = function() {
+  
+  var ndviViz = {min: 0.05, max: 0.8, palette: ['brown', 'yellow', 'green', 'darkgreen'], opacity: 0.7};
+  
+  var yearlyNDVI_vis = yearlyNDVI.map(function(image) {
+    var rgb = image.visualize(ndviViz).clip(aoi); 
+    return rgb.copyProperties(image, ['system:time_start', 'year']);
+  });
+  
+  // تصدير الفيديو إلى Google Drive
+  Export.video.toDrive({
+    collection: yearlyNDVI_vis,
+    description: 'Nile_NDVI_Animation_' + START_YEAR + 'to' + END_YEAR,
+    fileNamePrefix: 'NDVI_Animation',
+    framesPerSecond: 5,
+    region: aoi,
+    scale: 1000,
+    maxPixels: 1e10
+  });
+  
+  // رسالة تأكيد في الكونسول
+  print('تم إطلاق مهمة تصدير الرسوم المتحركة (GIF) إلى Google Drive. تحقق من علامة التبويب "Tasks".');
+  Map.add(ui.Label('✅ تم إطلاق مهمة التصدير إلى Google Drive. (تحقق من علامة التبويب "Tasks")', {color: 'green'}));
+};
+
+// =================================================================================
+// 7. الأحداث (Events) وعرض البدء - تم تحديثها
+// =================================================================================
+
+// ربط أحداث تغيير القيمة بدالة التحديث
+yearSlider.onChange(updateDashboard); 
+scarcitySlider.onChange(updateDashboard);
+pollutionSlider.onChange(updateDashboard);
+waterScarcityCheck.onChange(updateDashboard);
+vegetationCheck.onChange(updateDashboard);
+tempCheck.onChange(updateDashboard);
+pollutionCheck.onChange(updateDashboard);
+
+// ربط أزرار + و - بالوظائف الجديدة
+incrementButton.onClick(incrementYear);
+decrementButton.onClick(decrementYear);
+
+// ربط زر الرسوم المتحركة
+animateButton.onClick(createAnimation);
+
+// عرض الخريطة عند التشغيل
+updateDashboard();
